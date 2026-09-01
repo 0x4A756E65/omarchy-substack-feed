@@ -8,8 +8,8 @@ import qs.Ui
 Panel {
   id: root
 
-  moduleName: "aaron.substack"
-  ipcTarget: "aaron.substack"
+  moduleName: "0x4a756e65.omarchy-substack"
+  ipcTarget: "0x4a756e65.omarchy-substack"
   manageIpc: false
 
   readonly property string backendPath: Qt.resolvedUrl("substack_backend.py").toString().replace(/^file:\/\//, "")

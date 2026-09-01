@@ -5,7 +5,7 @@
 Security fixes are applied to the latest release. Upgrade with:
 
 ```bash
-omarchy plugin update aaron.substack
+omarchy plugin update 0x4a756e65.omarchy-substack
 ```
 
 ## Reporting a vulnerability
@@ -26,6 +26,9 @@ cookies in the desktop Secret Service keyring. Feed metadata is stored with
 user-only permissions under `~/.local/state/omarchy/substack/`.
 
 Authenticated HTTP requests are restricted to `https://substack.com:443` and
-never follow redirects. RSS requests are restricted to each publication's
-canonical `https://<subdomain>.substack.com:443/feed` and never follow
-redirects. Article links require HTTPS and are opened only after a user click.
+never follow redirects. RSS requests are restricted to either the canonical
+`https://<subdomain>.substack.com:443/feed` or a custom domain supplied by the
+authenticated account response. Custom domains must resolve through Substack's
+custom-domain service to public IP addresses and return the expected Substack
+publication identity. Article links require HTTPS and are opened only after a
+user click.

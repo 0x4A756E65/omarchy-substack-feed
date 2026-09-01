@@ -59,7 +59,7 @@ class BackendTests(unittest.TestCase):
             "feed_url": "https://smallhours.substack.com/feed",
         }
 
-    def test_subscription_response_becomes_canonical_rss(self):
+    def test_subscription_response_uses_authenticated_custom_domain_feed(self):
         recognized, publications = backend.parse_publications(
             {
                 "subscriptions": [{"publication_id": 42, "membership_state": "free_signup"}],
@@ -77,7 +77,8 @@ class BackendTests(unittest.TestCase):
         )
         self.assertTrue(recognized)
         self.assertEqual(publications[0]["url"], "https://smallhours.example")
-        self.assertEqual(publications[0]["feed_url"], "https://smallhours.substack.com/feed")
+        self.assertEqual(publications[0]["custom_domain"], "smallhours.example")
+        self.assertEqual(publications[0]["feed_url"], "https://smallhours.example/feed")
         self.assertEqual(publications[0]["logo_url"], "https://substackcdn.com/small-hours.png")
 
     def test_page_v2_marks_admin_publications_as_owned(self):
@@ -121,6 +122,26 @@ class BackendTests(unittest.TestCase):
         self.assertTrue(recognized)
         self.assertEqual(publications[0]["id"], "smallhours")
         self.assertEqual(publications[0]["membership"], "paid")
+        self.assertEqual(publications[0]["custom_domain"], "")
+        self.assertEqual(publications[0]["feed_url"], "https://smallhours.substack.com/feed")
+
+    def test_malformed_custom_domain_metadata_falls_back_to_canonical_feed(self):
+        recognized, publications = backend.parse_publications(
+            {
+                "subscriptions": [{"publication_id": 42}],
+                "publications": [
+                    {
+                        "id": 42,
+                        "name": "Small Hours",
+                        "subdomain": "smallhours",
+                        "custom_domain": "letters.example/unexpected-path",
+                    }
+                ],
+            }
+        )
+        self.assertTrue(recognized)
+        self.assertEqual(publications[0]["custom_domain"], "")
+        self.assertEqual(publications[0]["feed_url"], "https://smallhours.substack.com/feed")
 
     def test_rss_metadata_is_safely_normalized(self):
         articles = backend.parse_feed(RSS, self.publication())
@@ -213,6 +234,78 @@ class BackendTests(unittest.TestCase):
             "https://substack-post-media.s3.amazonaws.com/public/logo.png",
         )
 
+    def test_custom_feed_requires_authenticated_domain_substack_dns_and_response_identity(self):
+        publication = {
+            **self.publication(),
+            "subdomain": "smallhours",
+            "custom_domain": "letters.example",
+            "feed_url": "https://letters.example/feed",
+        }
+        resolved = [
+            (
+                backend.socket.AF_INET,
+                backend.socket.SOCK_STREAM,
+                6,
+                "target.substack-custom-domains.com",
+                ("104.18.36.24", 443),
+            )
+        ]
+        with mock.patch.object(backend.socket, "getaddrinfo", return_value=resolved):
+            self.assertEqual(
+                backend.publication_feed_target(publication),
+                ("https://letters.example/feed", "letters.example", True),
+            )
+        backend.validate_custom_feed_response(
+            publication,
+            {"x-sub": "smallhours", "X-Served-By": "Substack"},
+        )
+        with self.assertRaises(backend.BackendError):
+            backend.validate_custom_feed_response(
+                publication,
+                {"X-Sub": "someone-else", "X-Served-By": "Substack"},
+            )
+
+    def test_custom_feed_rejects_unapproved_hosts_private_dns_and_non_substack_dns(self):
+        publication = {
+            **self.publication(),
+            "subdomain": "smallhours",
+            "custom_domain": "letters.example",
+            "feed_url": "https://other.example/feed",
+        }
+        with self.assertRaises(backend.BackendError):
+            backend.publication_feed_target(publication)
+
+        publication["feed_url"] = "https://letters.example/feed"
+        private_dns = [
+            (
+                backend.socket.AF_INET,
+                backend.socket.SOCK_STREAM,
+                6,
+                "target.substack-custom-domains.com",
+                ("127.0.0.1", 443),
+            )
+        ]
+        with (
+            mock.patch.object(backend.socket, "getaddrinfo", return_value=private_dns),
+            self.assertRaises(backend.BackendError),
+        ):
+            backend.publication_feed_target(publication)
+
+        unrelated_dns = [
+            (
+                backend.socket.AF_INET,
+                backend.socket.SOCK_STREAM,
+                6,
+                "hosting.example",
+                ("93.184.216.34", 443),
+            )
+        ]
+        with (
+            mock.patch.object(backend.socket, "getaddrinfo", return_value=unrelated_dns),
+            self.assertRaises(backend.BackendError),
+        ):
+            backend.publication_feed_target(publication)
+
     def test_doctype_and_entities_are_rejected_before_xml_parsing(self):
         dangerous = b'<!DOCTYPE rss [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><rss><channel/></rss>'
         with self.assertRaises(backend.BackendError):
@@ -256,7 +349,7 @@ class BackendTests(unittest.TestCase):
         service = SERVICE_PATH.read_text(encoding="utf-8")
         self.assertNotIn("IpcHandler {", panel)
         self.assertEqual(service.count("IpcHandler {"), 1)
-        self.assertIn('target: "aaron.substack"', service)
+        self.assertIn('target: "0x4a756e65.omarchy-substack"', service)
         self.assertIn("textFormat: Text.PlainText", panel)
         self.assertIn("Blocked navigation outside Substack", BACKEND_PATH.read_text(encoding="utf-8"))
 

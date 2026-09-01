@@ -19,7 +19,7 @@ Item {
 
   function focusedPanel() {
     if (!root.shell || !root.shell.bar || typeof root.shell.bar.findPanelWidget !== "function") return null
-    return root.shell.bar.findPanelWidget("aaron.substack")
+    return root.shell.bar.findPanelWidget("0x4a756e65.omarchy-substack")
   }
 
   function openSettings() {
@@ -75,13 +75,13 @@ Item {
   // monitor. Owning IPC here prevents duplicate target registration while the
   // shell routes panel actions to the focused monitor.
   IpcHandler {
-    target: "aaron.substack"
+    target: "0x4a756e65.omarchy-substack"
 
-    function open(): string { return root.shell && root.shell.summon("aaron.substack", "") ? "ok" : "unavailable" }
-    function close(): string { return root.shell && root.shell.hide("aaron.substack") ? "ok" : "unavailable" }
+    function open(): string { return root.shell && root.shell.summon("0x4a756e65.omarchy-substack", "") ? "ok" : "unavailable" }
+    function close(): string { return root.shell && root.shell.hide("0x4a756e65.omarchy-substack") ? "ok" : "unavailable" }
     function show(): string { return open() }
     function hide(): string { return close() }
-    function toggle(): string { return root.shell && root.shell.toggle("aaron.substack", "") ? "ok" : "unavailable" }
+    function toggle(): string { return root.shell && root.shell.toggle("0x4a756e65.omarchy-substack", "") ? "ok" : "unavailable" }
     function refresh(): string {
       Quickshell.execDetached(["python3", root.backendPath, "refresh"])
       return "ok"
