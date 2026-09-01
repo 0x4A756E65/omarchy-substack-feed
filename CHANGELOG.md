@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 — 2026-09-01
+
+- Move from the legacy `aaron.substack` identity to the GitHub-namespaced
+  `0x4a756e65.omarchy-substack` replacement plugin.
+- Poll Substack publications with custom domains directly instead of following
+  their canonical feed redirects.
+- Require the custom domain from authenticated account metadata, Substack's
+  DNS target, public IP addresses, and matching Substack response identity.
+- Preserve article identities and reset cache validators when a publication
+  moves between its Substack and custom-domain feed origins.
+
 ## 0.3.2 — 2026-08-31
 
 - Follow the bar host's transparency-aware foreground for the bar glyph and

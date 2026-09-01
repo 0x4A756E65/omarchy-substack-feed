@@ -13,7 +13,7 @@ bodies stay on Substack.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/0x4A756E65/omarchy-substack.git --enable
+omarchy plugin add https://github.com/0x4A756E65/omarchy-substack-feed.git --enable
 ```
 
 Click the Substack item in the bar, choose **Connect Substack**, and sign in on
@@ -23,8 +23,23 @@ and pasted one-time links are also supported.
 Update a Git-managed installation with:
 
 ```bash
-omarchy plugin update aaron.substack
+omarchy plugin update 0x4a756e65.omarchy-substack
 ```
+
+### Moving from the legacy ID
+
+The original marketplace release used `aaron.substack`. To move without
+losing your authenticated session or local feed, do not log out first:
+
+```bash
+omarchy plugin add https://github.com/0x4A756E65/omarchy-substack-feed.git --yes
+omarchy plugin disable aaron.substack
+omarchy plugin enable 0x4a756e65.omarchy-substack --section right
+omarchy plugin remove aaron.substack --yes
+```
+
+The replacement intentionally keeps the same private state and Secret Service
+keyring locations. Reapply any non-default bar settings after enabling it.
 
 ## Remove
 
@@ -32,7 +47,7 @@ First open the plugin settings and choose **Log out**. This deletes the session
 from the desktop keyring and clears the local feed. Then remove the plugin:
 
 ```bash
-omarchy plugin remove aaron.substack
+omarchy plugin remove 0x4a756e65.omarchy-substack
 ```
 
 Removal does not change subscriptions on Substack or overwrite other Omarchy
@@ -44,6 +59,8 @@ configuration.
 - Excludes publications you administer by default, so your own posts do not
   take over the reading queue.
 - Polls each publication's canonical `https://<subdomain>.substack.com/feed`.
+- Uses an authenticated publication's Substack-hosted custom domain directly
+  when its canonical feed redirects there, while still rejecting redirects.
 - Uses ETag and Last-Modified validators to avoid downloading unchanged feeds.
 - Seeds the initial feed silently, then marks and notifies only later unseen
   posts.

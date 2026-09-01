@@ -21,6 +21,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -34,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-PLUGIN_ID = "aaron.substack"
+PLUGIN_ID = "0x4a756e65.omarchy-substack"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) OmarchySubstack/0.1"
 SUBSTACK_ORIGIN = "https://substack.com"
 SUBSCRIPTIONS_ENDPOINTS = (
@@ -51,6 +52,7 @@ SUBSCRIPTION_SYNC_SECONDS = 12 * 60 * 60
 EMPTY_SUBSCRIPTION_RECHECK_SECONDS = 15 * 60
 MAX_SECRET_BYTES = 64_000
 MAX_COOKIE_VALUE_BYTES = 16_384
+SUBSTACK_CUSTOM_DOMAIN_SUFFIX = ".substack-custom-domains.com"
 
 HOME = Path(os.environ.get("HOME", str(Path.home())))
 STATE_ROOT = Path(
@@ -399,7 +401,18 @@ def parse_publications(data: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]
         owned = str(publication_id) in owned_publication_ids
         custom_domain = str(publication.get("custom_domain") or "").strip().lower()
         custom_url = safe_article_url(f"https://{custom_domain}") if custom_domain else ""
+        custom_parsed = urllib.parse.urlsplit(custom_url) if custom_url else None
+        custom_host = (custom_parsed.hostname or "").lower() if custom_parsed else ""
+        if custom_parsed and (
+            custom_domain.rstrip(".") != custom_host
+            or custom_parsed.path not in ("", "/")
+            or custom_parsed.query
+            or custom_parsed.fragment
+        ):
+            custom_url = ""
+            custom_host = ""
         display_url = custom_url or f"https://{subdomain}.substack.com"
+        canonical_feed_url = f"https://{subdomain}.substack.com/feed"
         membership = str(subscription.get("membership_state") or subscription.get("type") or "subscribed")
         normalized.append(
             {
@@ -411,8 +424,13 @@ def parse_publications(data: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]
                 "logo_url": safe_image_url(str(publication.get("logo_url") or "")),
                 "author_photo_url": safe_image_url(str(publication.get("author_photo_url") or "")),
                 "subdomain": subdomain,
+                "custom_domain": custom_host,
                 "url": display_url,
-                "feed_url": f"https://{subdomain}.substack.com/feed",
+                # Substack redirects a publication's canonical feed to its
+                # custom domain. Go directly to the authenticated account
+                # metadata's domain so the generic HTTP client can continue
+                # rejecting every redirect.
+                "feed_url": f"https://{custom_host}/feed" if custom_host else canonical_feed_url,
                 "membership": membership,
                 "owned": owned,
             }
@@ -577,6 +595,81 @@ def safe_image_url(value: str) -> str:
     return safe if allowed else ""
 
 
+def validate_substack_custom_domain(hostname: str) -> None:
+    """Require a public DNS route through Substack's custom-domain service."""
+    host = str(hostname or "").lower().rstrip(".")
+    if not hostname_is_public_reference(host):
+        raise BackendError("The publication custom domain is not a public address")
+    try:
+        resolved = socket.getaddrinfo(
+            host,
+            443,
+            type=socket.SOCK_STREAM,
+            flags=socket.AI_CANONNAME,
+        )
+    except OSError as exc:
+        raise BackendError("The publication custom domain could not be resolved") from exc
+    if not resolved:
+        raise BackendError("The publication custom domain could not be resolved")
+
+    canonical_names = {
+        str(item[3] or "").lower().rstrip(".")
+        for item in resolved
+        if str(item[3] or "").strip()
+    }
+    if not any(name.endswith(SUBSTACK_CUSTOM_DOMAIN_SUFFIX) for name in canonical_names):
+        raise BackendError("The publication custom domain is not routed through Substack")
+
+    for item in resolved:
+        try:
+            address = ipaddress.ip_address(str(item[4][0]))
+        except (IndexError, TypeError, ValueError) as exc:
+            raise BackendError("The publication custom domain returned an invalid address") from exc
+        if not address.is_global:
+            raise BackendError("The publication custom domain resolved outside the public internet")
+
+
+def publication_feed_target(publication: dict[str, Any]) -> tuple[str, str, bool]:
+    """Return (URL, exact allowed host, is custom domain) for one feed."""
+    feed_url = safe_article_url(str(publication.get("feed_url") or ""))
+    if not feed_url:
+        raise BackendError("The publication feed address is invalid")
+    parsed = urllib.parse.urlsplit(feed_url)
+    if parsed.path != "/feed" or parsed.query or parsed.fragment:
+        raise BackendError("The publication feed address is invalid")
+
+    subdomain = str(publication.get("subdomain") or publication.get("id") or "").lower()
+    if not subdomain_is_safe(subdomain):
+        raise BackendError("The publication feed identity is invalid")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    canonical_host = f"{subdomain}.substack.com"
+    if host == canonical_host:
+        return feed_url, host, False
+
+    custom_domain = str(publication.get("custom_domain") or "").lower().rstrip(".")
+    if not custom_domain or host != custom_domain:
+        raise BackendError("The publication feed is outside its permitted domain")
+    validate_substack_custom_domain(custom_domain)
+    return feed_url, host, True
+
+
+def response_header(headers: dict[str, str], name: str) -> str:
+    expected = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == expected:
+            return str(value)
+    return ""
+
+
+def validate_custom_feed_response(publication: dict[str, Any], headers: dict[str, str]) -> None:
+    subdomain = str(publication.get("subdomain") or publication.get("id") or "").lower()
+    if (
+        response_header(headers, "X-Sub").lower() != subdomain
+        or response_header(headers, "X-Served-By").lower() != "substack"
+    ):
+        raise BackendError("The custom domain did not identify the expected Substack publication")
+
+
 def image_from_html(value: str) -> str:
     match = re.search(r"<img\b[^>]*\bsrc=[\"']([^\"']+)", value, flags=re.I)
     return safe_image_url(match.group(1)) if match else ""
@@ -627,7 +720,13 @@ def parse_feed(body: bytes, publication: dict[str, Any]) -> list[dict[str, Any]]
                         break
         if not image:
             image = image_from_html(raw_description)
-        identity = hashlib.sha256((publication["feed_url"] + "\0" + guid).encode("utf-8")).hexdigest()[:24]
+        subdomain = str(publication.get("subdomain") or publication.get("id") or "").lower()
+        identity_feed_url = (
+            f"https://{subdomain}.substack.com/feed"
+            if subdomain_is_safe(subdomain)
+            else str(publication["feed_url"])
+        )
+        identity = hashlib.sha256((identity_feed_url + "\0" + guid).encode("utf-8")).hexdigest()[:24]
         parsed_items.append(
             {
                 "id": identity,
@@ -772,15 +871,16 @@ def sync_publications(cookies: dict[str, str]) -> None:
         for publication in publications:
             active_ids.add(publication["id"])
             prior = prior_by_id.get(publication["id"], {})
+            same_feed = prior.get("feed_url") == publication.get("feed_url")
             publication.update(
                 {
-                    "etag": prior.get("etag", ""),
-                    "last_modified": prior.get("last_modified", ""),
+                    "etag": prior.get("etag", "") if same_feed else "",
+                    "last_modified": prior.get("last_modified", "") if same_feed else "",
                     "last_checked": prior.get("last_checked", 0),
-                    "next_poll": prior.get("next_poll", 0),
+                    "next_poll": prior.get("next_poll", 0) if same_feed else 0,
                     "seen_ids": prior.get("seen_ids", []),
-                    "error_count": prior.get("error_count", 0),
-                    "last_error": prior.get("last_error", ""),
+                    "error_count": prior.get("error_count", 0) if same_feed else 0,
+                    "last_error": prior.get("last_error", "") if same_feed else "",
                 }
             )
             next_publications.append(publication)
@@ -929,14 +1029,16 @@ class FeedDaemon:
             )
         )
         try:
-            expected_feed_host = f"{publication['subdomain']}.substack.com"
+            feed_url, expected_feed_host, is_custom_domain = publication_feed_target(publication)
             status, _, response_headers, body = request(
-                publication["feed_url"],
+                feed_url,
                 allowed_hosts={expected_feed_host},
                 headers=headers,
                 max_bytes=MAX_FEED_BYTES,
                 timeout=20,
             )
+            if is_custom_domain:
+                validate_custom_feed_response(publication, response_headers)
             if status == 304:
                 merge_not_modified(publication_id, checked)
                 return
