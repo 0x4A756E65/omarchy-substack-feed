@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "0x4a756e65.omarchy-substack",
   "name": "Substack Feed",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": "0x4A756E65",
   "license": "MIT",
   "description": "A calm, native feed of posts from your Substack subscriptions, with browser handoff and notifications.",

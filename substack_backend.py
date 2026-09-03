@@ -16,15 +16,19 @@ import email.utils
 import fcntl
 import hashlib
 import html
+import http.client
 import ipaddress
 import json
+import math
 import os
 import re
+import secrets
 import signal
 import socket
+import ssl
+import stat
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -45,14 +49,20 @@ SUBSCRIPTIONS_ENDPOINTS = (
 )
 PROFILE_ENDPOINT = "/api/v1/user/profile/self"
 MAX_FEED_BYTES = 4_000_000
-MAX_JSON_BYTES = 8_000_000
+MAX_JSON_BYTES = 2_000_000
+MAX_STATE_BYTES = 2_000_000
+MAX_CONFIG_BYTES = 4_096
 MAX_ARTICLES = 160
 MAX_SEEN_PER_PUBLICATION = 240
+MAX_SUBSCRIPTIONS = 512
+MAX_PUBLICATIONS = 1_024
+MAX_PUBLICATION_USERS = 1_024
 SUBSCRIPTION_SYNC_SECONDS = 12 * 60 * 60
 EMPTY_SUBSCRIPTION_RECHECK_SECONDS = 15 * 60
 MAX_SECRET_BYTES = 64_000
 MAX_COOKIE_VALUE_BYTES = 16_384
 SUBSTACK_CUSTOM_DOMAIN_SUFFIX = ".substack-custom-domains.com"
+AUTH_TOP_LEVEL_HOSTS = frozenset({"substack.com", "www.substack.com"})
 
 HOME = Path(os.environ.get("HOME", str(Path.home())))
 STATE_ROOT = Path(
@@ -119,61 +129,251 @@ def default_config() -> dict[str, Any]:
     }
 
 
-def ensure_dirs() -> None:
-    STATE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with contextlib.suppress(OSError):
-        os.chmod(STATE_ROOT, 0o700)
+DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+PRIVATE_FILE_FLAGS = os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def _absolute_state_root() -> str:
+    root = os.path.abspath(os.fspath(STATE_ROOT))
+    if root == os.path.sep:
+        raise BackendError("The private state directory is invalid")
+    return root
+
+
+def _verify_parent_directory(info: os.stat_result) -> None:
+    if not stat.S_ISDIR(info.st_mode):
+        raise BackendError("A private state path component is not a directory")
+    mode = stat.S_IMODE(info.st_mode)
+    sticky_root_directory = info.st_uid == 0 and bool(mode & stat.S_ISVTX)
+    if info.st_uid not in {0, os.geteuid()} or (mode & 0o022 and not sticky_root_directory):
+        raise BackendError("A private state path component has unsafe ownership or permissions")
 
 
 @contextlib.contextmanager
-def locked(path: Path):
-    ensure_dirs()
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    with os.fdopen(descriptor, "a+") as handle:
-        with contextlib.suppress(OSError):
-            os.fchmod(handle.fileno(), 0o600)
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield handle
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-def read_json(path: Path, fallback: Any) -> Any:
+def state_directory():
+    """Open STATE_ROOT without following mutable pathname components."""
+    current = os.open(os.path.sep, DIRECTORY_OPEN_FLAGS)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value
-    except (OSError, json.JSONDecodeError, TypeError):
+        _verify_parent_directory(os.fstat(current))
+        parts = [part for part in Path(_absolute_state_root()).parts if part != os.path.sep]
+        for index, part in enumerate(parts):
+            if part in {"", ".", ".."}:
+                raise BackendError("The private state directory is invalid")
+            try:
+                next_descriptor = os.open(part, DIRECTORY_OPEN_FLAGS, dir_fd=current)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=current)
+                    os.fsync(current)
+                    next_descriptor = os.open(part, DIRECTORY_OPEN_FLAGS, dir_fd=current)
+                except OSError as exc:
+                    raise BackendError("The private state directory could not be created safely") from exc
+            except OSError as exc:
+                raise BackendError("The private state directory contains an unsafe link") from exc
+
+            try:
+                info = os.fstat(next_descriptor)
+                _verify_parent_directory(info)
+                if index == len(parts) - 1:
+                    if info.st_uid != os.geteuid():
+                        raise BackendError("The private state directory is not owned by this user")
+                    if stat.S_IMODE(info.st_mode) != 0o700:
+                        os.fchmod(next_descriptor, 0o700)
+                        info = os.fstat(next_descriptor)
+                    if stat.S_IMODE(info.st_mode) != 0o700:
+                        raise BackendError("The private state directory permissions are unsafe")
+            except Exception:
+                os.close(next_descriptor)
+                raise
+            os.close(current)
+            current = next_descriptor
+        yield current
+    finally:
+        os.close(current)
+
+
+def ensure_dirs() -> None:
+    with state_directory():
+        pass
+
+
+def _state_filename(path: Path) -> str:
+    root = _absolute_state_root()
+    target = os.path.abspath(os.fspath(path))
+    if os.path.dirname(target) != root:
+        raise BackendError("A private file escaped the state directory")
+    name = os.path.basename(target)
+    if not name or name in {".", ".."} or os.path.sep in name:
+        raise BackendError("A private file name is invalid")
+    return name
+
+
+def _verify_private_file(descriptor: int, *, max_bytes: int | None = None) -> os.stat_result:
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+        raise BackendError("A private state file has an unsafe type or owner")
+    if stat.S_IMODE(info.st_mode) != 0o600:
+        raise BackendError("A private state file has unsafe permissions")
+    if max_bytes is not None and info.st_size > max_bytes:
+        raise BackendError("A private state file exceeds its safety limit")
+    return info
+
+
+def _open_private_file(
+    directory: int,
+    name: str,
+    flags: int,
+    *,
+    create: bool = False,
+    max_bytes: int | None = None,
+) -> int:
+    open_flags = flags | PRIVATE_FILE_FLAGS
+    if create:
+        open_flags |= os.O_CREAT
+    try:
+        descriptor = os.open(name, open_flags, 0o600, dir_fd=directory)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise BackendError("A private state file could not be opened safely") from exc
+    try:
+        initial = os.fstat(descriptor)
+        if not stat.S_ISREG(initial.st_mode) or initial.st_uid != os.geteuid() or initial.st_nlink != 1:
+            raise BackendError("A private state file has an unsafe type or owner")
+        if create and stat.S_IMODE(initial.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
+        _verify_private_file(descriptor, max_bytes=max_bytes)
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _read_bounded(descriptor: int, max_bytes: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = max_bytes + 1
+    while remaining > 0:
+        chunk = os.read(descriptor, min(65_536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    payload = b"".join(chunks)
+    if len(payload) > max_bytes:
+        raise BackendError("A private state file exceeds its safety limit")
+    return payload
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise BackendError("A private state file could not be written")
+        offset += written
+
+
+@contextlib.contextmanager
+def locked(path: Path, *, blocking: bool = True):
+    with state_directory() as directory:
+        descriptor = _open_private_file(directory, _state_filename(path), os.O_RDWR, create=True, max_bytes=0)
+        try:
+            operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            fcntl.flock(descriptor, operation)
+            yield descriptor
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
+def read_json(path: Path, fallback: Any, *, max_bytes: int) -> Any:
+    try:
+        with state_directory() as directory:
+            descriptor = _open_private_file(
+                directory,
+                _state_filename(path),
+                os.O_RDONLY,
+                max_bytes=max_bytes,
+            )
+            try:
+                payload = _read_bounded(descriptor, max_bytes)
+            finally:
+                os.close(descriptor)
+        return json.loads(payload.decode("utf-8"))
+    except FileNotFoundError:
+        return fallback
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, TypeError):
         return fallback
 
 
-def atomic_json(path: Path, value: Any, mode: int = 0o600) -> None:
-    ensure_dirs()
-    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, mode)
-        os.replace(temporary, path)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temporary)
+def atomic_json(path: Path, value: Any, *, max_bytes: int = MAX_STATE_BYTES) -> None:
+    payload = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(payload) > max_bytes:
+        raise BackendError("The local feed snapshot exceeds its safety limit")
+    target = _state_filename(path)
+    with state_directory() as directory:
+        try:
+            existing = _open_private_file(directory, target, os.O_RDONLY, max_bytes=max_bytes)
+        except FileNotFoundError:
+            existing = -1
+        if existing >= 0:
+            os.close(existing)
+
+        temporary = f".{target}.{os.getpid()}.{secrets.token_hex(12)}"
+        descriptor = -1
+        try:
+            descriptor = _open_private_file(
+                directory,
+                temporary,
+                os.O_WRONLY | os.O_EXCL,
+                create=True,
+                max_bytes=max_bytes,
+            )
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary, target, src_dir_fd=directory, dst_dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=directory)
+
+
+def private_file_exists(path: Path, *, max_bytes: int) -> bool:
+    with state_directory() as directory:
+        try:
+            descriptor = _open_private_file(
+                directory,
+                _state_filename(path),
+                os.O_RDONLY,
+                max_bytes=max_bytes,
+            )
+        except FileNotFoundError:
+            return False
+        os.close(descriptor)
+        return True
+
+
+def consume_refresh_request() -> bool:
+    with state_directory() as directory:
+        name = _state_filename(REFRESH_REQUEST)
+        try:
+            descriptor = _open_private_file(directory, name, os.O_RDONLY, max_bytes=0)
+        except FileNotFoundError:
+            return False
+        os.close(descriptor)
+        os.unlink(name, dir_fd=directory)
+        os.fsync(directory)
+        return True
 
 
 def load_state() -> dict[str, Any]:
-    value = read_json(STATE_FILE, default_state())
-    if not isinstance(value, dict):
-        return default_state()
-    base = default_state()
-    base.update(value)
-    if not isinstance(base.get("subscriptions"), list):
-        base["subscriptions"] = []
-    if not isinstance(base.get("articles"), list):
-        base["articles"] = []
-    return base
+    value = read_json(STATE_FILE, default_state(), max_bytes=MAX_STATE_BYTES)
+    return normalize_state(value)
 
 
 def mutate_state(mutator: Callable[[dict[str, Any]], Any]) -> Any:
@@ -181,18 +381,20 @@ def mutate_state(mutator: Callable[[dict[str, Any]], Any]) -> Any:
         before = load_state()
         state = json.loads(json.dumps(before))
         result = mutator(state)
+        state = normalize_state(state)
         state["unread_count"] = sum(1 for article in state.get("articles", []) if article.get("unread"))
         if state != before:
             state["updated_at"] = iso_from_ts()
-            atomic_json(STATE_FILE, state)
+            atomic_json(STATE_FILE, state, max_bytes=MAX_STATE_BYTES)
         return result
 
 
 def load_config() -> dict[str, Any]:
-    value = read_json(CONFIG_FILE, default_config())
+    value = read_json(CONFIG_FILE, default_config(), max_bytes=MAX_CONFIG_BYTES)
     base = default_config()
     if isinstance(value, dict):
-        base.update(value)
+        base["notify"] = value.get("notify") is not False
+        base["include_owned"] = value.get("include_owned") is True
     base["notify"] = base.get("notify") is not False
     base["include_owned"] = base.get("include_owned") is True
     return base
@@ -203,8 +405,10 @@ def save_config(changes: dict[str, Any]) -> None:
     # reload. Merge under a process lock so one toggle never erases another.
     with locked(CONFIG_LOCK):
         config = load_config()
-        config.update(changes)
-        atomic_json(CONFIG_FILE, config)
+        for key in ("notify", "include_owned"):
+            if key in changes:
+                config[key] = changes[key] is True
+        atomic_json(CONFIG_FILE, config, max_bytes=MAX_CONFIG_BYTES)
 
 
 def secret_lookup() -> dict[str, str]:
@@ -286,6 +490,87 @@ class RejectRedirects(urllib.request.HTTPRedirectHandler):
 HTTP_OPENER = urllib.request.build_opener(RejectRedirects())
 
 
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection whose TCP peer comes from one validated DNS result."""
+
+    def __init__(self, hostname: str, addresses: tuple[str, ...], *, timeout: int) -> None:
+        if not addresses:
+            raise BackendError("The publication has no validated network address")
+        try:
+            parsed_addresses = [ipaddress.ip_address(address) for address in addresses]
+        except ValueError as exc:
+            raise BackendError("The publication has an invalid network address") from exc
+        if any(not address.is_global for address in parsed_addresses):
+            raise BackendError("The publication network address is not public")
+        super().__init__(hostname, port=443, timeout=timeout, context=ssl.create_default_context())
+        self.addresses = tuple(str(address) for address in parsed_addresses)
+
+    def connect(self) -> None:
+        last_error: OSError | None = None
+        expected = {str(ipaddress.ip_address(address)) for address in self.addresses}
+        for address in self.addresses:
+            parsed = ipaddress.ip_address(address)
+            family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
+            destination: tuple[Any, ...] = (address, self.port, 0, 0) if parsed.version == 6 else (address, self.port)
+            raw_socket = socket.socket(family, socket.SOCK_STREAM)
+            try:
+                raw_socket.settimeout(self.timeout)
+                raw_socket.connect(destination)
+                peer = str(ipaddress.ip_address(str(raw_socket.getpeername()[0])))
+                if peer not in expected:
+                    raise OSError("connected peer was outside the validated address set")
+                # self.host remains the authenticated custom hostname, so the
+                # default SSL context performs SNI and certificate-hostname
+                # verification even though TCP is connected to a pinned IP.
+                tls_socket = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+                tls_peer = str(ipaddress.ip_address(str(tls_socket.getpeername()[0])))
+                if tls_peer not in expected:
+                    tls_socket.close()
+                    raise OSError("TLS peer was outside the validated address set")
+                self.sock = tls_socket
+                return
+            except OSError as exc:
+                last_error = exc
+                raw_socket.close()
+        raise last_error or OSError("no validated address was reachable")
+
+
+def pinned_https_request(
+    url: str,
+    *,
+    hostname: str,
+    addresses: tuple[str, ...],
+    headers: dict[str, str],
+    max_bytes: int,
+    timeout: int,
+) -> tuple[int, str, dict[str, str], bytes]:
+    parsed = urllib.parse.urlsplit(url)
+    target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    connection = PinnedHTTPSConnection(hostname, addresses, timeout=timeout)
+    try:
+        connection.request("GET", target, headers=headers)
+        response = connection.getresponse()
+        status = int(response.status)
+        response_headers = {str(key): str(value) for key, value in response.getheaders()}
+        if status == 304:
+            return status, url, response_headers, b""
+        if 300 <= status < 400:
+            raise BackendError("Substack returned an unexpected redirect")
+        if status in (401, 403):
+            raise AuthenticationExpired("Substack asked you to sign in again")
+        if status < 200 or status >= 300:
+            response.read(min(max_bytes, 64_000))
+            raise BackendError(f"Substack returned HTTP {status}")
+        body = response.read(max_bytes + 1)
+        if len(body) > max_bytes:
+            raise BackendError("Substack returned more data than the safety limit")
+        return status, url, response_headers, body
+    except (http.client.HTTPException, ssl.SSLError, TimeoutError, OSError) as exc:
+        raise BackendError("Could not securely reach the Substack publication") from exc
+    finally:
+        connection.close()
+
+
 def validate_request_target(url: str, allowed_hosts: set[str], cookies: dict[str, str] | None) -> None:
     try:
         parsed = urllib.parse.urlsplit(url)
@@ -314,6 +599,7 @@ def request(
     headers: dict[str, str] | None = None,
     max_bytes: int = MAX_JSON_BYTES,
     timeout: int = 20,
+    pinned_addresses: tuple[str, ...] = (),
 ) -> tuple[int, str, dict[str, str], bytes]:
     validate_request_target(url, allowed_hosts, cookies)
     request_headers = {
@@ -323,6 +609,17 @@ def request(
     request_headers.update(headers or {})
     if cookies:
         request_headers["Cookie"] = cookie_header(cookies)
+    if pinned_addresses:
+        if cookies:
+            raise BackendError("Authentication cannot be sent through a pinned publication connection")
+        return pinned_https_request(
+            url,
+            hostname=(urllib.parse.urlsplit(url).hostname or "").lower().rstrip("."),
+            addresses=pinned_addresses,
+            headers=request_headers,
+            max_bytes=max_bytes,
+            timeout=timeout,
+        )
     req = urllib.request.Request(url, headers=request_headers)
     try:
         response = HTTP_OPENER.open(req, timeout=timeout)
@@ -356,6 +653,29 @@ def request_json(path: str, cookies: dict[str, str]) -> dict[str, Any]:
     return value
 
 
+def bounded_scalar(value: Any, max_chars: int) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return ""
+    source = str(value)
+    return source[:max_chars]
+
+
+def bounded_clean_text(value: Any, limit: int, *, source_limit: int = 4_096) -> str:
+    return clean_text(bounded_scalar(value, source_limit), limit)
+
+
+def bounded_number(value: Any, *, minimum: float = 0, maximum: float = 4_102_444_800) -> float:
+    if isinstance(value, bool):
+        return minimum
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return minimum
+    if not math.isfinite(number):
+        return minimum
+    return min(maximum, max(minimum, number))
+
+
 def subdomain_is_safe(value: str) -> bool:
     return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value.lower()))
 
@@ -368,21 +688,39 @@ def parse_publications(data: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]
         raw_subscriptions = payload.get("items")
     if not isinstance(raw_subscriptions, list):
         return False, []
+    if len(raw_subscriptions) > MAX_SUBSCRIPTIONS:
+        raise BackendError("Substack returned too many subscriptions")
 
     lookup: dict[str, dict[str, Any]] = {}
     raw_publications = payload.get("publications", [])
     if isinstance(payload.get("publicationMap"), dict):
+        if len(payload["publicationMap"]) > MAX_PUBLICATIONS:
+            raise BackendError("Substack returned too many publications")
         raw_publications = list(payload["publicationMap"].values())
+    if not isinstance(raw_publications, list):
+        raw_publications = []
+    if len(raw_publications) > MAX_PUBLICATIONS:
+        raise BackendError("Substack returned too many publications")
     for publication in raw_publications:
         if isinstance(publication, dict) and publication.get("id") is not None:
-            lookup[str(publication.get("id"))] = publication
+            publication_id = bounded_scalar(publication.get("id"), 128)
+            if publication_id:
+                lookup[publication_id] = publication
 
+    raw_publication_users = payload.get("publicationUsers", [])
+    if not isinstance(raw_publication_users, list):
+        raw_publication_users = []
+    if len(raw_publication_users) > MAX_PUBLICATION_USERS:
+        raise BackendError("Substack returned too many publication memberships")
     owned_publication_ids = {
-        str(link.get("publication_id"))
-        for link in payload.get("publicationUsers", [])
+        bounded_scalar(link.get("publication_id"), 128)
+        for link in raw_publication_users
         if isinstance(link, dict)
         and link.get("publication_id") is not None
-        and (link.get("is_primary") is True or str(link.get("role") or "").lower() == "admin")
+        and (
+            link.get("is_primary") is True
+            or bounded_scalar(link.get("role"), 32).lower() == "admin"
+        )
     }
 
     normalized: list[dict[str, Any]] = []
@@ -392,14 +730,15 @@ def parse_publications(data: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]
             continue
         publication = subscription.get("publication") or subscription.get("pub")
         if not isinstance(publication, dict):
-            publication = lookup.get(str(subscription.get("publication_id")), {})
-        subdomain = str(publication.get("subdomain") or "").strip().lower()
+            publication = lookup.get(bounded_scalar(subscription.get("publication_id"), 128), {})
+        subdomain = bounded_scalar(publication.get("subdomain"), 63).strip().lower()
         if not subdomain_is_safe(subdomain) or subdomain in seen:
             continue
         seen.add(subdomain)
         publication_id = publication.get("id") or subscription.get("publication_id")
-        owned = str(publication_id) in owned_publication_ids
-        custom_domain = str(publication.get("custom_domain") or "").strip().lower()
+        persisted_publication_id = bounded_scalar(publication_id, 128)
+        owned = persisted_publication_id in owned_publication_ids
+        custom_domain = bounded_scalar(publication.get("custom_domain"), 253).strip().lower()
         custom_url = safe_article_url(f"https://{custom_domain}") if custom_domain else ""
         custom_parsed = urllib.parse.urlsplit(custom_url) if custom_url else None
         custom_host = (custom_parsed.hostname or "").lower() if custom_parsed else ""
@@ -413,16 +752,20 @@ def parse_publications(data: dict[str, Any]) -> tuple[bool, list[dict[str, Any]]
             custom_host = ""
         display_url = custom_url or f"https://{subdomain}.substack.com"
         canonical_feed_url = f"https://{subdomain}.substack.com/feed"
-        membership = str(subscription.get("membership_state") or subscription.get("type") or "subscribed")
+        membership = bounded_clean_text(
+            subscription.get("membership_state") or subscription.get("type") or "subscribed",
+            64,
+            source_limit=128,
+        )
         normalized.append(
             {
                 "id": subdomain,
-                "publication_id": publication_id,
-                "name": str(publication.get("name") or subdomain),
-                "author": str(publication.get("author_name") or publication.get("author") or ""),
-                "description": clean_text(str(publication.get("description") or ""), 220),
-                "logo_url": safe_image_url(str(publication.get("logo_url") or "")),
-                "author_photo_url": safe_image_url(str(publication.get("author_photo_url") or "")),
+                "publication_id": persisted_publication_id,
+                "name": bounded_clean_text(publication.get("name") or subdomain, 220),
+                "author": bounded_clean_text(publication.get("author_name") or publication.get("author"), 120),
+                "description": bounded_clean_text(publication.get("description"), 220),
+                "logo_url": safe_image_url(bounded_scalar(publication.get("logo_url"), 4_096)),
+                "author_photo_url": safe_image_url(bounded_scalar(publication.get("author_photo_url"), 4_096)),
                 "subdomain": subdomain,
                 "custom_domain": custom_host,
                 "url": display_url,
@@ -470,9 +813,9 @@ def fetch_profile(cookies: dict[str, str]) -> dict[str, Any]:
     except BackendError:
         return {}
     return {
-        "name": str(data.get("name") or data.get("handle") or "Substack reader"),
-        "handle": str(data.get("handle") or ""),
-        "photo_url": safe_image_url(str(data.get("photo_url") or "")),
+        "name": bounded_clean_text(data.get("name") or data.get("handle") or "Substack reader", 160),
+        "handle": bounded_clean_text(data.get("handle"), 80),
+        "photo_url": safe_image_url(bounded_scalar(data.get("photo_url"), 4_096)),
     }
 
 
@@ -595,8 +938,137 @@ def safe_image_url(value: str) -> str:
     return safe if allowed else ""
 
 
-def validate_substack_custom_domain(hostname: str) -> None:
-    """Require a public DNS route through Substack's custom-domain service."""
+def bounded_header_value(value: Any, max_chars: int) -> str:
+    candidate = bounded_scalar(value, max_chars)
+    return "" if re.search(r"[\x00-\x1f\x7f]", candidate) else candidate
+
+
+def normalize_subscription(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    subdomain = bounded_scalar(value.get("subdomain") or value.get("id"), 63).lower()
+    if not subdomain_is_safe(subdomain):
+        return None
+    custom_domain = bounded_scalar(value.get("custom_domain"), 253).lower().rstrip(".")
+    if custom_domain and not hostname_is_public_reference(custom_domain):
+        custom_domain = ""
+    canonical_url = f"https://{subdomain}.substack.com"
+    display_url = f"https://{custom_domain}" if custom_domain else canonical_url
+    feed_url = f"{display_url}/feed"
+    seen_ids = value.get("seen_ids") if isinstance(value.get("seen_ids"), list) else []
+    return {
+        "id": subdomain,
+        "publication_id": bounded_scalar(value.get("publication_id"), 128) or subdomain,
+        "name": bounded_clean_text(value.get("name") or subdomain, 220),
+        "author": bounded_clean_text(value.get("author"), 120),
+        "description": bounded_clean_text(value.get("description"), 220),
+        "logo_url": safe_image_url(bounded_scalar(value.get("logo_url"), 4_096)),
+        "author_photo_url": safe_image_url(bounded_scalar(value.get("author_photo_url"), 4_096)),
+        "subdomain": subdomain,
+        "custom_domain": custom_domain,
+        "url": display_url,
+        "feed_url": feed_url,
+        "membership": bounded_clean_text(value.get("membership") or "subscribed", 64, source_limit=128),
+        "owned": value.get("owned") is True,
+        "etag": bounded_header_value(value.get("etag"), 1_024),
+        "last_modified": bounded_header_value(value.get("last_modified"), 256),
+        "last_checked": bounded_number(value.get("last_checked")),
+        "next_poll": bounded_number(value.get("next_poll")),
+        "seen_ids": [
+            item
+            for item in (bounded_scalar(item, 24) for item in seen_ids[:MAX_SEEN_PER_PUBLICATION])
+            if re.fullmatch(r"[0-9a-f]{24}", item)
+        ],
+        "error_count": int(bounded_number(value.get("error_count"), maximum=1_000)),
+        "last_error": bounded_clean_text(value.get("last_error"), 180, source_limit=720),
+    }
+
+
+def normalize_article(value: Any, publication_ids: set[str]) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    article_id = bounded_scalar(value.get("id"), 24)
+    publication_id = bounded_scalar(value.get("publication_id"), 63).lower()
+    link = safe_article_url(bounded_scalar(value.get("link"), 4_096))
+    if (
+        not re.fullmatch(r"[0-9a-f]{24}", article_id)
+        or publication_id not in publication_ids
+        or not link
+    ):
+        return None
+    return {
+        "id": article_id,
+        "publication_id": publication_id,
+        "publication": bounded_clean_text(value.get("publication") or publication_id, 220),
+        "author": bounded_clean_text(value.get("author"), 120),
+        "title": bounded_clean_text(value.get("title") or "Untitled post", 220),
+        "link": link,
+        "published": bounded_scalar(value.get("published"), 64),
+        "published_ts": bounded_number(value.get("published_ts")),
+        "excerpt": bounded_clean_text(value.get("excerpt"), 280, source_limit=1_120),
+        "image_url": safe_image_url(bounded_scalar(value.get("image_url"), 4_096)),
+        "publication_logo_url": safe_image_url(bounded_scalar(value.get("publication_logo_url"), 4_096)),
+        "unread": value.get("unread") is True,
+    }
+
+
+def normalize_state(value: Any) -> dict[str, Any]:
+    """Return only the bounded schema consumed by the daemon and QML panel."""
+    if not isinstance(value, dict) or type(value.get("schema")) is not int or value.get("schema") != 1:
+        return default_state()
+    raw_subscriptions = value.get("subscriptions") if isinstance(value.get("subscriptions"), list) else []
+    subscriptions: list[dict[str, Any]] = []
+    seen_publications: set[str] = set()
+    for candidate in raw_subscriptions[:MAX_SUBSCRIPTIONS]:
+        publication = normalize_subscription(candidate)
+        if publication is None or publication["id"] in seen_publications:
+            continue
+        seen_publications.add(publication["id"])
+        subscriptions.append(publication)
+
+    raw_articles = value.get("articles") if isinstance(value.get("articles"), list) else []
+    articles: list[dict[str, Any]] = []
+    seen_articles: set[str] = set()
+    for candidate in raw_articles[:MAX_ARTICLES]:
+        article = normalize_article(candidate, seen_publications)
+        if article is None or article["id"] in seen_articles:
+            continue
+        seen_articles.add(article["id"])
+        articles.append(article)
+    articles.sort(key=lambda item: item["published_ts"], reverse=True)
+
+    raw_account = value.get("account") if isinstance(value.get("account"), dict) else {}
+    status = bounded_scalar(value.get("status"), 32)
+    if status not in {"starting", "syncing", "ready", "error", "expired", "disconnected"}:
+        status = "starting"
+    state = {
+        "schema": 1,
+        "status": status,
+        "message": bounded_clean_text(value.get("message") or "Starting Substack…", 240, source_limit=960),
+        "authenticated": value.get("authenticated") is True,
+        "syncing": value.get("syncing") is True,
+        "account": {
+            "name": bounded_clean_text(raw_account.get("name"), 160),
+            "handle": bounded_clean_text(raw_account.get("handle"), 80),
+            "photo_url": safe_image_url(bounded_scalar(raw_account.get("photo_url"), 4_096)),
+        },
+        "subscriptions": subscriptions,
+        "articles": articles,
+        "unread_count": sum(1 for article in articles if article["unread"]),
+        "last_sync": bounded_scalar(value.get("last_sync"), 64) or None,
+        "last_subscription_sync": bounded_scalar(value.get("last_subscription_sync"), 64) or None,
+        "subscription_sync_due": bounded_number(value.get("subscription_sync_due")),
+        "empty_subscription_confirmations": int(
+            bounded_number(value.get("empty_subscription_confirmations"), maximum=2)
+        ),
+        "last_error": bounded_clean_text(value.get("last_error"), 240, source_limit=960),
+        "updated_at": bounded_scalar(value.get("updated_at"), 64) or iso_from_ts(),
+    }
+    return state
+
+
+def resolve_substack_custom_domain(hostname: str) -> tuple[str, ...]:
+    """Resolve once and return only public addresses routed through Substack."""
     host = str(hostname or "").lower().rstrip(".")
     if not hostname_is_public_reference(host):
         raise BackendError("The publication custom domain is not a public address")
@@ -620,6 +1092,7 @@ def validate_substack_custom_domain(hostname: str) -> None:
     if not any(name.endswith(SUBSTACK_CUSTOM_DOMAIN_SUFFIX) for name in canonical_names):
         raise BackendError("The publication custom domain is not routed through Substack")
 
+    addresses: list[str] = []
     for item in resolved:
         try:
             address = ipaddress.ip_address(str(item[4][0]))
@@ -627,10 +1100,16 @@ def validate_substack_custom_domain(hostname: str) -> None:
             raise BackendError("The publication custom domain returned an invalid address") from exc
         if not address.is_global:
             raise BackendError("The publication custom domain resolved outside the public internet")
+        normalized = str(address)
+        if normalized not in addresses:
+            addresses.append(normalized)
+    if not addresses:
+        raise BackendError("The publication custom domain could not be resolved")
+    return tuple(addresses)
 
 
-def publication_feed_target(publication: dict[str, Any]) -> tuple[str, str, bool]:
-    """Return (URL, exact allowed host, is custom domain) for one feed."""
+def publication_feed_target(publication: dict[str, Any]) -> tuple[str, str, tuple[str, ...]]:
+    """Return the exact URL, host, and DNS-pinned addresses for one feed."""
     feed_url = safe_article_url(str(publication.get("feed_url") or ""))
     if not feed_url:
         raise BackendError("The publication feed address is invalid")
@@ -644,13 +1123,12 @@ def publication_feed_target(publication: dict[str, Any]) -> tuple[str, str, bool
     host = (parsed.hostname or "").lower().rstrip(".")
     canonical_host = f"{subdomain}.substack.com"
     if host == canonical_host:
-        return feed_url, host, False
+        return feed_url, host, ()
 
     custom_domain = str(publication.get("custom_domain") or "").lower().rstrip(".")
     if not custom_domain or host != custom_domain:
         raise BackendError("The publication feed is outside its permitted domain")
-    validate_substack_custom_domain(custom_domain)
-    return feed_url, host, True
+    return feed_url, host, resolve_substack_custom_domain(custom_domain)
 
 
 def response_header(headers: dict[str, str], name: str) -> str:
@@ -693,7 +1171,7 @@ def parse_feed(body: bytes, publication: dict[str, Any]) -> list[dict[str, Any]]
 
     parsed_items: list[dict[str, Any]] = []
     for node in nodes[:40]:
-        title = clean_text(first_child_text(node, {"title"}), 220)
+        title = bounded_clean_text(first_child_text(node, {"title"}), 220)
         link = first_child_text(node, {"link"})
         if not link:
             for child in list(node):
@@ -704,11 +1182,14 @@ def parse_feed(body: bytes, publication: dict[str, Any]) -> list[dict[str, Any]]
         if not title or not link:
             continue
 
-        guid = first_child_text(node, {"guid", "id"}) or link
+        guid = bounded_scalar(first_child_text(node, {"guid", "id"}), 4_096) or link
         author = first_child_text(node, {"creator", "author"}) or publication.get("author", "")
-        published_raw = first_child_text(node, {"pubdate", "published", "updated"})
+        published_raw = bounded_scalar(first_child_text(node, {"pubdate", "published", "updated"}), 128)
         published, published_ts = parse_date(published_raw)
-        raw_description = first_child_text(node, {"description", "summary", "encoded", "content"})
+        raw_description = bounded_scalar(
+            first_child_text(node, {"description", "summary", "encoded", "content"}),
+            16_384,
+        )
         image = ""
         for child in list(node):
             if local_name(child.tag) in {"enclosure", "thumbnail", "content"}:
@@ -732,12 +1213,12 @@ def parse_feed(body: bytes, publication: dict[str, Any]) -> list[dict[str, Any]]
                 "id": identity,
                 "publication_id": publication["id"],
                 "publication": publication["name"],
-                "author": clean_text(author, 120),
+                "author": bounded_clean_text(author, 120),
                 "title": title,
                 "link": link,
                 "published": published,
                 "published_ts": published_ts,
-                "excerpt": clean_text(raw_description, 280),
+                "excerpt": bounded_clean_text(raw_description, 280, source_limit=16_384),
                 "image_url": image,
                 "publication_logo_url": publication.get("logo_url", ""),
             }
@@ -898,49 +1379,70 @@ def sync_publications(cookies: dict[str, str]) -> None:
     mutate_state(update)
 
 
+def send_desktop_notification(summary: Any, body: Any, exec_argv: list[str] | None = None) -> bool:
+    """Send private display text over D-Bus, never through a process argument."""
+    try:
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+
+        hints = {
+            "urgency": GLib.Variant("y", 1),
+            "omarchy-glyph": GLib.Variant("s", "󰂺"),
+        }
+        if exec_argv:
+            bounded_argv = [bounded_scalar(argument, 4_096) for argument in exec_argv[:8]]
+            hints["omarchy-exec-argv"] = GLib.Variant(
+                "s",
+                json.dumps(bounded_argv, ensure_ascii=False, separators=(",", ":")),
+            )
+        parameters = GLib.Variant(
+            "(susssasa{sv}i)",
+            (
+                "Substack",
+                0,
+                "",
+                bounded_clean_text(summary or "New Substack post", 220),
+                bounded_clean_text(body or "Substack", 220),
+                [],
+                hints,
+                -1,
+            ),
+        )
+        connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        connection.call_sync(
+            "org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+            "Notify",
+            parameters,
+            GLib.VariantType("(u)"),
+            Gio.DBusCallFlags.NONE,
+            8_000,
+            None,
+        )
+        return True
+    except Exception:
+        # Notifications are advisory; feed synchronization must continue if
+        # the desktop bus or notification service is temporarily unavailable.
+        return False
+
+
 def send_notifications(articles: list[dict[str, Any]]) -> None:
     if not articles or not load_config().get("notify", True):
         return
     for article in articles[:3]:
-        command = [
-            "omarchy",
-            "notification",
-            "send",
-            "--app-name",
-            "Substack",
-            "-g",
-            "󰂺",
-            "-u",
-            "normal",
+        send_desktop_notification(
             article.get("title", "New Substack post"),
             article.get("publication", "Substack"),
-            "--exec",
-            "python3",
-            str(SCRIPT_PATH),
-            "open",
-            article["id"],
-        ]
-        with contextlib.suppress(OSError):
-            subprocess.run(command, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            ["python3", str(SCRIPT_PATH), "open", bounded_scalar(article.get("id"), 24)],
+        )
     if len(articles) > 3:
-        with contextlib.suppress(OSError):
-            subprocess.run(
-                [
-                    "omarchy",
-                    "notification",
-                    "send",
-                    "--app-name",
-                    "Substack",
-                    "-g",
-                    "󰂺",
-                    f"{len(articles) - 3} more new posts",
-                    "Open the Substack panel to see them.",
-                ],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=8,
-            )
+        send_desktop_notification(
+            f"{min(len(articles) - 3, MAX_ARTICLES)} more new posts",
+            "Open the Substack panel to see them.",
+        )
 
 
 class FeedDaemon:
@@ -1029,23 +1531,24 @@ class FeedDaemon:
             )
         )
         try:
-            feed_url, expected_feed_host, is_custom_domain = publication_feed_target(publication)
+            feed_url, expected_feed_host, pinned_addresses = publication_feed_target(publication)
             status, _, response_headers, body = request(
                 feed_url,
                 allowed_hosts={expected_feed_host},
                 headers=headers,
                 max_bytes=MAX_FEED_BYTES,
                 timeout=20,
+                pinned_addresses=pinned_addresses,
             )
-            if is_custom_domain:
+            if pinned_addresses:
                 validate_custom_feed_response(publication, response_headers)
             if status == 304:
                 merge_not_modified(publication_id, checked)
                 return
             items = parse_feed(body, publication)
             new_articles = merge_feed(publication_id, items, checked)
-            etag = str(response_headers.get("ETag") or "")
-            last_modified = str(response_headers.get("Last-Modified") or "")
+            etag = bounded_header_value(response_headers.get("ETag"), 1_024)
+            last_modified = bounded_header_value(response_headers.get("Last-Modified"), 256)
             if etag or last_modified:
                 def store_cache_validators(state: dict[str, Any]) -> None:
                     target = next((item for item in state["subscriptions"] if item.get("id") == publication_id), None)
@@ -1080,51 +1583,57 @@ class FeedDaemon:
 
         mutate_state(update)
 
+    def run_locked(self) -> int:
+        mutate_state(lambda state: state.update({"status": "starting", "message": "Starting Substack…"}))
+        idle_rounds = 0
+        while self.running:
+            worked = False
+            if consume_refresh_request():
+                self.force_refresh()
+                worked = True
+
+            if self.subscription_sync():
+                worked = True
+
+            publication = self.next_due_publication()
+            if publication is not None:
+                self.poll_publication(publication)
+                worked = True
+                time.sleep(0.75)
+            else:
+                self.settle_status()
+
+            idle_rounds = 0 if worked else idle_rounds + 1
+            time.sleep(0.35 if worked else min(3.0, 0.5 + idle_rounds * 0.25))
+        return 0
+
     def run(self) -> int:
         ensure_dirs()
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
-        if not STATE_FILE.exists():
-            atomic_json(STATE_FILE, default_state())
-
-        daemon_descriptor = os.open(DAEMON_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
-        with os.fdopen(daemon_descriptor, "a+") as daemon_handle:
-            with contextlib.suppress(OSError):
-                os.fchmod(daemon_handle.fileno(), 0o600)
-            try:
-                fcntl.flock(daemon_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return 0
-
-            mutate_state(lambda state: state.update({"status": "starting", "message": "Starting Substack…"}))
-            idle_rounds = 0
-            while self.running:
-                worked = False
-                if REFRESH_REQUEST.exists():
-                    with contextlib.suppress(FileNotFoundError):
-                        REFRESH_REQUEST.unlink()
-                    self.force_refresh()
-                    worked = True
-
-                if self.subscription_sync():
-                    worked = True
-
-                publication = self.next_due_publication()
-                if publication is not None:
-                    self.poll_publication(publication)
-                    worked = True
-                    time.sleep(0.75)
-                else:
-                    self.settle_status()
-
-                idle_rounds = 0 if worked else idle_rounds + 1
-                time.sleep(0.35 if worked else min(3.0, 0.5 + idle_rounds * 0.25))
-        return 0
+        if not private_file_exists(STATE_FILE, max_bytes=MAX_STATE_BYTES):
+            atomic_json(STATE_FILE, default_state(), max_bytes=MAX_STATE_BYTES)
+        try:
+            with locked(DAEMON_LOCK, blocking=False):
+                return self.run_locked()
+        except BlockingIOError:
+            return 0
 
 
 def touch_refresh() -> None:
-    ensure_dirs()
-    REFRESH_REQUEST.touch(mode=0o600, exist_ok=True)
+    with state_directory() as directory:
+        descriptor = _open_private_file(
+            directory,
+            _state_filename(REFRESH_REQUEST),
+            os.O_WRONLY | os.O_TRUNC,
+            create=True,
+            max_bytes=0,
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(directory)
 
 
 def command_open(article_id: str) -> int:
@@ -1195,16 +1704,19 @@ def magic_link_allowed(value: str) -> bool:
     hostname = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or parsed.username or parsed.password or port not in (None, 443):
         return False
-    if hostname != "substack.com" and not hostname.endswith(".substack.com"):
+    if hostname not in AUTH_TOP_LEVEL_HOSTS:
         return False
     query = urllib.parse.parse_qs(parsed.query)
-    return parsed.path.rstrip("/") == "/sign-in" and bool(query.get("token"))
+    tokens = query.get("token") or []
+    return (
+        parsed.path.rstrip("/") == "/sign-in"
+        and len(tokens) == 1
+        and 0 < len(tokens[0]) <= 4_096
+    )
 
 
 def auth_navigation_allowed(value: str) -> bool:
     source = str(value or "").strip()
-    if source == "about:blank":
-        return True
     if len(source) > 8192:
         return False
     try:
@@ -1215,7 +1727,7 @@ def auth_navigation_allowed(value: str) -> bool:
     hostname = (parsed.hostname or "").lower().rstrip(".")
     if parsed.scheme != "https" or parsed.username or parsed.password or port not in (None, 443):
         return False
-    return hostname == "substack.com" or hostname.endswith(".substack.com") or hostname == "challenges.cloudflare.com"
+    return hostname in AUTH_TOP_LEVEL_HOSTS
 
 
 def _auth_window_unlocked() -> int:
@@ -1306,9 +1818,16 @@ def _auth_window_unlocked() -> int:
         def on_load_changed(self, _view: Any, event: Any) -> None:
             self.back_button.set_sensitive(True)
             current_uri = str(self.webview.get_uri() or "")
-            if auth_navigation_allowed(current_uri):
+            if current_uri == "about:blank":
+                self.header.props.subtitle = "No remote origin · temporary private session"
+            elif auth_navigation_allowed(current_uri):
                 hostname = urllib.parse.urlsplit(current_uri).hostname or "substack.com"
                 self.header.props.subtitle = f"{hostname} · temporary private session"
+            else:
+                self.webview.stop_loading()
+                self.header.props.subtitle = "Blocked origin · temporary private session"
+                self.banner.set_text("Blocked navigation outside the permitted Substack sign-in hosts")
+                return
             if event == WebKit2.LoadEvent.FINISHED:
                 if self.password_requested:
                     self.password_requested = False
@@ -1327,10 +1846,15 @@ def _auth_window_unlocked() -> int:
                 decision.ignore()
                 self.banner.set_text("Blocked an invalid navigation request")
                 return True
-            if auth_navigation_allowed(uri):
+            if auth_navigation_allowed(uri) and decision_type == WebKit2.PolicyDecisionType.NAVIGATION_ACTION:
                 return False
+            if auth_navigation_allowed(uri) and decision_type == WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION:
+                decision.ignore()
+                self.webview.load_uri(uri)
+                return True
             decision.ignore()
-            self.banner.set_text("Blocked navigation outside Substack")
+            self.header.props.subtitle = "Blocked origin · temporary private session"
+            self.banner.set_text("Blocked navigation outside the permitted Substack sign-in hosts")
             return True
 
         def on_permission_request(self, _view: Any, request: Any) -> bool:
@@ -1338,7 +1862,7 @@ def _auth_window_unlocked() -> int:
             return True
 
         def on_load_failed(self, _view: Any, _event: Any, _uri: str, error: Any) -> bool:
-            self.banner.set_text("Substack could not load: " + str(error.message))
+            self.banner.set_text("Substack could not load: " + bounded_clean_text(error.message, 180))
             return False
 
         def go_back(self, *_: Any) -> None:
@@ -1449,17 +1973,12 @@ def _auth_window_unlocked() -> int:
 
 
 def auth_window() -> int:
-    ensure_dirs()
-    descriptor = os.open(AUTH_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
-    with os.fdopen(descriptor, "a+") as handle:
-        with contextlib.suppress(OSError):
-            os.fchmod(handle.fileno(), 0o600)
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print("A Substack sign-in window is already open", file=sys.stderr)
-            return 3
-        return _auth_window_unlocked()
+    try:
+        with locked(AUTH_LOCK, blocking=False):
+            return _auth_window_unlocked()
+    except BlockingIOError:
+        print("A Substack sign-in window is already open", file=sys.stderr)
+        return 3
 
 
 def parse_bool(value: str) -> bool:
@@ -1479,6 +1998,15 @@ def command_config(key: str, value: str) -> int:
     return 0
 
 
+def command_snapshot() -> int:
+    payload = json.dumps(load_state(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(payload) > MAX_STATE_BYTES:
+        raise BackendError("The local feed snapshot exceeds its safety limit")
+    sys.stdout.buffer.write(payload)
+    sys.stdout.buffer.write(b"\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Omarchy Substack feed backend")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1488,6 +2016,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("mark-all-read")
     subparsers.add_parser("disconnect")
     subparsers.add_parser("status")
+    subparsers.add_parser("snapshot")
     open_parser = subparsers.add_parser("open")
     open_parser.add_argument("article_id")
     read_parser = subparsers.add_parser("mark-read")
@@ -1516,6 +2045,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "status":
         print(json.dumps(load_state(), ensure_ascii=False, indent=2))
         return 0
+    if args.command == "snapshot":
+        return command_snapshot()
     if args.command == "config":
         return command_config(args.key, args.value)
     return 2
