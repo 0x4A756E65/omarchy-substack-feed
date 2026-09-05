@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.1 — 2026-09-02
+
+- Restrict privileged sign-in navigation to the exact `substack.com` and
+  `www.substack.com` origins, blocking session-bearing navigation to
+  publication subdomains.
+- Connect custom-domain RSS requests directly to the one validated DNS address
+  set, verify the connected peer, and retain TLS SNI and hostname validation.
+- Anchor private state operations to verified directory descriptors with
+  no-follow, nonblocking regular-file checks, bounded reads, durable atomic
+  writes, and strict ownership and permission requirements.
+- Replace the panel's direct state-file reader with a bounded, schema-checked
+  backend snapshot channel.
+- Bound account collections and every persisted/displayed string, rebuild
+  loaded state from a strict allowlisted schema, and send private notification
+  text directly over D-Bus instead of process arguments.
+
 ## 0.4.0 — 2026-09-01
 
 - Move from the legacy `aaron.substack` identity to the GitHub-namespaced

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +38,7 @@ class BackendTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
+        self.root = root
         backend.STATE_ROOT = root
         backend.STATE_FILE = root / "state.json"
         backend.CONFIG_FILE = root / "config.json"
@@ -188,14 +190,17 @@ class BackendTests(unittest.TestCase):
         self.assertTrue(backend.magic_link_allowed("https://www.substack.com/sign-in?token=abc"))
         self.assertFalse(backend.magic_link_allowed("http://substack.com/sign-in?token=abc"))
         self.assertFalse(backend.magic_link_allowed("https://substack.example/sign-in?token=abc"))
+        self.assertFalse(backend.magic_link_allowed("https://attacker.substack.com/sign-in?token=abc"))
         self.assertFalse(backend.magic_link_allowed("https://substack.com/library?token=abc"))
         self.assertFalse(backend.magic_link_allowed("https://substack.com/sign-in"))
         self.assertFalse(backend.magic_link_allowed("https://substack.com:8443/sign-in?token=abc"))
 
-    def test_auth_navigation_is_restricted_to_substack_and_cloudflare_challenge(self):
+    def test_auth_navigation_uses_exact_hosts_and_blocks_publication_subdomains(self):
         self.assertTrue(backend.auth_navigation_allowed("https://substack.com/sign-in"))
         self.assertTrue(backend.auth_navigation_allowed("https://www.substack.com/library"))
-        self.assertTrue(backend.auth_navigation_allowed("https://challenges.cloudflare.com/turnstile"))
+        self.assertFalse(backend.auth_navigation_allowed("https://challenges.cloudflare.com/turnstile"))
+        self.assertFalse(backend.auth_navigation_allowed("https://attacker.substack.com/sign-in"))
+        self.assertFalse(backend.auth_navigation_allowed("about:blank"))
         self.assertFalse(backend.auth_navigation_allowed("https://example.com/sign-in"))
         self.assertFalse(backend.auth_navigation_allowed("http://substack.com/sign-in"))
         self.assertFalse(backend.auth_navigation_allowed("https://substack.com:8443/sign-in"))
@@ -253,7 +258,7 @@ class BackendTests(unittest.TestCase):
         with mock.patch.object(backend.socket, "getaddrinfo", return_value=resolved):
             self.assertEqual(
                 backend.publication_feed_target(publication),
-                ("https://letters.example/feed", "letters.example", True),
+                ("https://letters.example/feed", "letters.example", ("104.18.36.24",)),
             )
         backend.validate_custom_feed_response(
             publication,
@@ -306,6 +311,200 @@ class BackendTests(unittest.TestCase):
         ):
             backend.publication_feed_target(publication)
 
+    def test_pinned_https_connection_uses_validated_ip_and_original_hostname(self):
+        class FakeSocket:
+            def __init__(self, peer):
+                self.peer = peer
+                self.destination = None
+                self.timeout = None
+                self.closed = False
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def connect(self, destination):
+                self.destination = destination
+
+            def getpeername(self):
+                return (self.peer, 443)
+
+            def close(self):
+                self.closed = True
+
+        class FakeContext:
+            def __init__(self, tls_socket):
+                self.tls_socket = tls_socket
+                self.server_hostname = None
+
+            def wrap_socket(self, _raw_socket, *, server_hostname):
+                self.server_hostname = server_hostname
+                return self.tls_socket
+
+        raw_socket = FakeSocket("93.184.216.34")
+        tls_socket = FakeSocket("93.184.216.34")
+        context = FakeContext(tls_socket)
+        with (
+            mock.patch.object(backend.ssl, "create_default_context", return_value=context),
+            mock.patch.object(backend.socket, "socket", return_value=raw_socket),
+            mock.patch.object(backend.socket, "getaddrinfo", side_effect=AssertionError("second DNS lookup")),
+        ):
+            connection = backend.PinnedHTTPSConnection(
+                "letters.example",
+                ("93.184.216.34",),
+                timeout=12,
+            )
+            connection.connect()
+
+        self.assertEqual(raw_socket.destination, ("93.184.216.34", 443))
+        self.assertEqual(raw_socket.timeout, 12)
+        self.assertEqual(context.server_hostname, "letters.example")
+        self.assertIs(connection.sock, tls_socket)
+
+    def test_pinned_https_connection_rejects_unvalidated_peer_and_private_input(self):
+        class FakeSocket:
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _destination):
+                pass
+
+            def getpeername(self):
+                return ("1.1.1.1", 443)
+
+            def close(self):
+                pass
+
+        with self.assertRaises(backend.BackendError):
+            backend.PinnedHTTPSConnection("letters.example", ("127.0.0.1",), timeout=12)
+        with (
+            mock.patch.object(backend.socket, "socket", return_value=FakeSocket()),
+            self.assertRaises(OSError),
+        ):
+            backend.PinnedHTTPSConnection(
+                "letters.example",
+                ("93.184.216.34",),
+                timeout=12,
+            ).connect()
+
+    def test_private_state_files_reject_symlinks_fifos_and_oversized_reads(self):
+        victim = self.root / "victim.json"
+        victim.write_text('{"schema":1}', encoding="utf-8")
+        victim.chmod(0o600)
+        backend.STATE_FILE.unlink()
+        backend.STATE_FILE.symlink_to(victim)
+        with self.assertRaises(backend.BackendError):
+            backend.load_state()
+
+        backend.STATE_FILE.unlink()
+        os.mkfifo(backend.STATE_FILE, 0o600)
+        with self.assertRaises(backend.BackendError):
+            backend.load_state()
+
+        backend.STATE_FILE.unlink()
+        backend.STATE_FILE.write_bytes(b"x" * (backend.MAX_STATE_BYTES + 1))
+        backend.STATE_FILE.chmod(0o600)
+        with self.assertRaises(backend.BackendError):
+            backend.load_state()
+
+        backend.STATE_FILE.unlink()
+        backend.STATE_FILE.write_text(json.dumps(backend.default_state()), encoding="utf-8")
+        backend.STATE_FILE.chmod(0o644)
+        with self.assertRaises(backend.BackendError):
+            backend.load_state()
+
+        backend.STATE_FILE.chmod(0o600)
+        hardlink = self.root / "state-hardlink.json"
+        os.link(backend.STATE_FILE, hardlink)
+        with self.assertRaises(backend.BackendError):
+            backend.load_state()
+
+    def test_atomic_state_write_is_private_regular_and_bounded(self):
+        backend.atomic_json(backend.STATE_FILE, backend.default_state())
+        info = backend.STATE_FILE.stat()
+        self.assertTrue(info.st_mode & 0o170000 == 0o100000)
+        self.assertEqual(info.st_mode & 0o777, 0o600)
+        self.assertEqual(info.st_uid, os.geteuid())
+        self.assertEqual(info.st_nlink, 1)
+        self.assertLessEqual(info.st_size, backend.MAX_STATE_BYTES)
+        self.assertEqual(list(self.root.glob(".state.json.*")), [])
+
+    def test_loaded_state_is_rebuilt_from_bounded_known_schema(self):
+        state = backend.default_state()
+        state["unknown"] = {"nested": ["ignored"]}
+        state["account"] = {"name": "n" * 1_000, "unknown": "ignored"}
+        state["subscriptions"] = [
+            {
+                "id": "smallhours",
+                "name": "p" * 1_000,
+                "feed_url": "https://attacker.example/feed",
+                "unknown": "ignored",
+            }
+        ]
+        state["articles"] = [
+            {
+                "id": "a" * 24,
+                "publication_id": "smallhours",
+                "publication": "Small Hours",
+                "title": "t" * 1_000,
+                "link": "https://smallhours.substack.com/p/post",
+                "unread": True,
+                "unknown": "ignored",
+            }
+        ]
+        normalized = backend.normalize_state(state)
+        self.assertNotIn("unknown", normalized)
+        self.assertNotIn("unknown", normalized["account"])
+        self.assertNotIn("unknown", normalized["subscriptions"][0])
+        self.assertNotIn("unknown", normalized["articles"][0])
+        self.assertEqual(len(normalized["account"]["name"]), 160)
+        self.assertEqual(len(normalized["subscriptions"][0]["name"]), 220)
+        self.assertEqual(len(normalized["articles"][0]["title"]), 220)
+        self.assertEqual(normalized["subscriptions"][0]["feed_url"], "https://smallhours.substack.com/feed")
+
+    def test_account_collections_and_persisted_fields_have_independent_caps(self):
+        with self.assertRaises(backend.BackendError):
+            backend.parse_publications({"subscriptions": [{}] * (backend.MAX_SUBSCRIPTIONS + 1)})
+        with self.assertRaises(backend.BackendError):
+            backend.parse_publications(
+                {
+                    "subscriptions": [],
+                    "publicationMap": {
+                        str(index): {} for index in range(backend.MAX_PUBLICATIONS + 1)
+                    },
+                }
+            )
+        with self.assertRaises(backend.BackendError):
+            backend.parse_publications(
+                {
+                    "subscriptions": [],
+                    "publicationUsers": [{}] * (backend.MAX_PUBLICATION_USERS + 1),
+                }
+            )
+        recognized, publications = backend.parse_publications(
+            {
+                "subscriptions": [{"publication_id": 42}],
+                "publications": [{"id": 42, "subdomain": "smallhours", "name": "n" * 10_000}],
+            }
+        )
+        self.assertTrue(recognized)
+        self.assertEqual(len(publications[0]["name"]), 220)
+
+    def test_private_notification_text_never_enters_process_argv(self):
+        article = {
+            "id": "a" * 24,
+            "title": "Private paid-post title",
+            "publication": "Private publication",
+        }
+        with (
+            mock.patch.object(backend, "load_config", return_value={"notify": True}),
+            mock.patch.object(backend, "send_desktop_notification", return_value=True) as send,
+        ):
+            backend.send_notifications([article])
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[:2], (article["title"], article["publication"]))
+        source = BACKEND_PATH.read_text(encoding="utf-8")
+        self.assertNotIn('"notification",\n', source)
+
     def test_doctype_and_entities_are_rejected_before_xml_parsing(self):
         dangerous = b'<!DOCTYPE rss [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><rss><channel/></rss>'
         with self.assertRaises(backend.BackendError):
@@ -351,7 +550,11 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(service.count("IpcHandler {"), 1)
         self.assertIn('target: "0x4a756e65.omarchy-substack"', service)
         self.assertIn("textFormat: Text.PlainText", panel)
-        self.assertIn("Blocked navigation outside Substack", BACKEND_PATH.read_text(encoding="utf-8"))
+        self.assertNotIn("FileView {", panel)
+        self.assertIn('command: ["python3", root.backendPath, "snapshot"]', panel)
+        self.assertIn("maxSnapshotCharacters: 2000000", panel)
+        self.assertIn("normalizeSnapshot", panel)
+        self.assertIn("Blocked navigation outside the permitted Substack sign-in hosts", BACKEND_PATH.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

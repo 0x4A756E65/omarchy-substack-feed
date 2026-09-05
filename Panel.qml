@@ -13,10 +13,9 @@ Panel {
   manageIpc: false
 
   readonly property string backendPath: Qt.resolvedUrl("substack_backend.py").toString().replace(/^file:\/\//, "")
-  readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") !== ""
-    ? Quickshell.env("XDG_STATE_HOME")
-    : Quickshell.env("HOME") + "/.local/state"
-  readonly property string statePath: stateHome + "/omarchy/substack/state.json"
+  readonly property int maxSnapshotCharacters: 2000000
+  readonly property int maxSubscriptions: 512
+  readonly property int maxArticles: 160
 
   property var feedState: ({
     status: "starting",
@@ -76,17 +75,107 @@ Panel {
     return "Substack"
   }
 
+  function boundedString(value, limit, fallback) {
+    return typeof value === "string" && value.length <= limit ? value : (fallback || "")
+  }
+
+  function boundedNumber(value) {
+    return typeof value === "number" && isFinite(value) && value >= 0 ? value : 0
+  }
+
+  function boundedHttpsUrl(value) {
+    var source = boundedString(value, 4096, "")
+    return /^https:\/\/[^\s/@]+(?::443)?(?:\/|$)/i.test(source) ? source : ""
+  }
+
+  function normalizeSnapshot(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || value.schema !== 1) return null
+    if (!Array.isArray(value.subscriptions) || value.subscriptions.length > maxSubscriptions) return null
+    if (!Array.isArray(value.articles) || value.articles.length > maxArticles) return null
+
+    var publications = []
+    var publicationIds = Object.create(null)
+    for (var i = 0; i < value.subscriptions.length; i++) {
+      var sourcePublication = value.subscriptions[i]
+      if (!sourcePublication || typeof sourcePublication !== "object" || Array.isArray(sourcePublication)) continue
+      var publicationId = boundedString(sourcePublication.id, 63, "").toLowerCase()
+      if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(publicationId) || publicationIds[publicationId]) continue
+      publicationIds[publicationId] = true
+      publications.push({
+        id: publicationId,
+        name: boundedString(sourcePublication.name, 220, publicationId),
+        logo_url: boundedHttpsUrl(sourcePublication.logo_url)
+      })
+    }
+
+    var stories = []
+    var storyIds = Object.create(null)
+    for (var j = 0; j < value.articles.length; j++) {
+      var sourceArticle = value.articles[j]
+      if (!sourceArticle || typeof sourceArticle !== "object" || Array.isArray(sourceArticle)) continue
+      var articleId = boundedString(sourceArticle.id, 24, "")
+      var articlePublicationId = boundedString(sourceArticle.publication_id, 63, "").toLowerCase()
+      if (!/^[0-9a-f]{24}$/.test(articleId) || storyIds[articleId] || !publicationIds[articlePublicationId]) continue
+      storyIds[articleId] = true
+      stories.push({
+        id: articleId,
+        publication_id: articlePublicationId,
+        publication: boundedString(sourceArticle.publication, 220, articlePublicationId),
+        author: boundedString(sourceArticle.author, 120, ""),
+        title: boundedString(sourceArticle.title, 220, "Untitled post"),
+        link: boundedHttpsUrl(sourceArticle.link),
+        published: boundedString(sourceArticle.published, 64, ""),
+        published_ts: boundedNumber(sourceArticle.published_ts),
+        excerpt: boundedString(sourceArticle.excerpt, 280, ""),
+        image_url: boundedHttpsUrl(sourceArticle.image_url),
+        publication_logo_url: boundedHttpsUrl(sourceArticle.publication_logo_url),
+        unread: sourceArticle.unread === true
+      })
+    }
+
+    var sourceAccount = value.account && typeof value.account === "object" && !Array.isArray(value.account)
+      ? value.account : ({})
+    var allowedStatuses = ["starting", "syncing", "ready", "error", "expired", "disconnected"]
+    var status = boundedString(value.status, 32, "starting")
+    if (allowedStatuses.indexOf(status) < 0) status = "starting"
+    return {
+      schema: 1,
+      status: status,
+      message: boundedString(value.message, 240, "Starting Substack…"),
+      authenticated: value.authenticated === true,
+      syncing: value.syncing === true,
+      account: {
+        name: boundedString(sourceAccount.name, 160, ""),
+        handle: boundedString(sourceAccount.handle, 80, ""),
+        photo_url: boundedHttpsUrl(sourceAccount.photo_url)
+      },
+      subscriptions: publications,
+      articles: stories,
+      unread_count: stories.reduce(function(total, article) { return total + (article.unread ? 1 : 0) }, 0),
+      last_sync: boundedString(value.last_sync, 64, ""),
+      last_error: boundedString(value.last_error, 240, "")
+    }
+  }
+
   function parseState(content) {
+    var source = String(content || "")
+    if (source.length > maxSnapshotCharacters) {
+      localError = "The local feed snapshot exceeded its safety limit"
+      return
+    }
     try {
-      var value = JSON.parse(String(content || ""))
-      if (value && typeof value === "object") {
-        feedState = value
-        stateLoaded = true
-        localError = ""
-      }
+      var value = normalizeSnapshot(JSON.parse(source))
+      if (!value) throw new Error("invalid schema")
+      feedState = value
+      stateLoaded = true
+      localError = ""
     } catch (error) {
       localError = "The local feed snapshot is invalid"
     }
+  }
+
+  function loadSnapshot() {
+    if (!stateProcess.running) stateProcess.running = true
   }
 
   function runBackend(args) {
@@ -199,21 +288,25 @@ Panel {
   onOpenedChanged: if (!opened) showSettings(false)
   onShowOnboardingChanged: if (showOnboarding) showSettings(false)
   Component.onCompleted: {
-    stateFile.reload()
+    loadSnapshot()
     syncSettings()
   }
 
-  FileView {
-    id: stateFile
-    path: root.statePath
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.parseState(text())
-    onLoadFailed: {
-      root.stateLoaded = true
-      root.localError = "Waiting for the Substack service"
+  Process {
+    id: stateProcess
+    command: ["python3", root.backendPath, "snapshot"]
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.parseState(text)
+    }
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var message = String(text || "").trim()
+        if (message !== "") root.localError = "Waiting for the Substack service"
+      }
     }
   }
 
@@ -232,7 +325,7 @@ Panel {
     onExited: function(exitCode) {
       if (exitCode === 0) {
         root.authError = ""
-        stateFile.reload()
+        root.loadSnapshot()
       } else if (root.authError === "") {
         root.authError = exitCode === 3
           ? "A Substack sign-in window is already open"
@@ -241,14 +334,11 @@ Panel {
     }
   }
 
-  // The panel can be instantiated a few milliseconds before the service has
-  // created its first snapshot. FileView cannot watch a file that did not yet
-  // exist, so retry only until the first successful load.
   Timer {
-    interval: 1200
+    interval: 1500
     repeat: true
-    running: root.localError !== ""
-    onTriggered: stateFile.reload()
+    running: true
+    onTriggered: root.loadSnapshot()
   }
 
   Timer {

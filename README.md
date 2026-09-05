@@ -110,12 +110,25 @@ Feed state lives at:
 
 The state file contains publication and article metadata, but no session
 cookie. The cookie is never written to `shell.json`, the repository, or the
-plugin directory.
+plugin directory. State, config, locks, and refresh requests are opened relative
+to a verified private directory descriptor; links, special files, unsafe
+ownership or modes, and oversized files are rejected. Writes are atomic and
+durable. The panel never reads `state.json` itself: it accepts only a bounded,
+allowlisted snapshot emitted by the backend.
 
-The temporary sign-in window rejects navigation outside Substack and its
-Cloudflare challenge origin, blocks permission requests, and displays the
-current origin in its header. Publication and article text is always rendered
-as plain text.
+The temporary sign-in window permits top-level navigation only to the exact
+`substack.com` and `www.substack.com` HTTPS origins, blocks session-bearing
+navigation to publication subdomains, denies web permissions, and shows only a
+validated origin in its header. Cloudflare may provide embedded
+challenge resources, but it is never a permitted top-level destination.
+Publication and article text is always rendered as plain text.
+
+Custom-domain RSS uses one DNS resolution. The TCP connection is made directly
+to that validated public address set, the connected peer is checked, and TLS
+still authenticates the publication hostname through SNI and certificate
+verification. Redirects remain disabled and account cookies are never attached
+to RSS requests. Private post and publication names reach the notification
+service over D-Bus, not process arguments.
 
 ## Architecture and compatibility
 
@@ -132,9 +145,10 @@ items. Canonical publication RSS is smaller, more predictable, and a better
 fit for notifications.
 
 Runtime dependencies are provided by Omarchy: Quickshell, Python 3, GTK 3,
-WebKitGTK 4.1, and the Secret Service command-line client (`secret-tool`). The
-plugin has no third-party Python packages, install hooks, privileged commands,
-or bundled executable dependencies.
+WebKitGTK 4.1, GObject Introspection (`Gio`/`GLib`), and the Secret Service
+command-line client (`secret-tool`). The plugin has no third-party Python
+packages, install hooks, privileged commands, or bundled executable
+dependencies.
 
 Security reports are welcome through GitHub's private vulnerability reporting
 flow; see [SECURITY.md](SECURITY.md).
